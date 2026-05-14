@@ -1,0 +1,7 @@
+.venv/
+.uploads/
+.image_cache/
+__pycache__/
+*.pyc
+html/
+pdf/

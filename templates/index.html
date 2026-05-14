@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>HTML to Reader PDF</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="source-pane">
+        <div class="brand">
+          <h1>HTML to Reader PDF</h1>
+          <p id="status">Preparing workspace...</p>
+        </div>
+
+        <form id="load-form" class="load-form">
+          <label>
+            HTML file path
+            <input id="path-input" name="path" list="known-files" placeholder="/path/to/saved/page.html">
+          </label>
+          <datalist id="known-files">
+            {% for file in files %}
+              <option value="{{ file.path }}">{{ file.name }}</option>
+            {% endfor %}
+          </datalist>
+          <label>
+            Or upload a single HTML file
+            <input id="file-input" name="file" type="file" accept=".html,.htm,text/html">
+          </label>
+          <button type="submit">Load</button>
+        </form>
+
+        <div class="output-controls">
+          <label>
+            Output directory
+            <input id="output-dir" value="{{ output_dir }}">
+          </label>
+          <label>
+            PDF filename
+            <input id="filename" placeholder="Auto-filled after loading">
+          </label>
+          <button id="generate" disabled>Generate PDF</button>
+          <p id="result" class="result"></p>
+        </div>
+
+        <div class="block-list-head">
+          <strong>Content blocks</strong>
+          <div>
+            <button id="select-all" type="button" disabled>All</button>
+            <button id="select-none" type="button" disabled>None</button>
+          </div>
+        </div>
+        <div id="block-list" class="block-list empty">Load an HTML file to begin.</div>
+      </section>
+
+      <section class="preview-pane">
+        <div class="tabs">
+          <button class="tab active" data-tab="reader">Reader Preview</button>
+          <button class="tab" data-tab="original">Original Preview</button>
+        </div>
+        <div id="reader-preview" class="reader-preview"></div>
+        <iframe id="original-preview" class="original-preview" sandbox=""></iframe>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
