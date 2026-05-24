@@ -18,7 +18,7 @@ http://127.0.0.1:5050
 
 ## Workflow
 
-1. Enter a path to a saved `.html`/`.htm` file, or pick one from the suggestions under `html/`.
+1. Enter a path to a saved `.html`/`.htm` file, pick one from the suggestions under `html/`, or choose a single file to upload. The app loads it automatically.
 2. Review the automatically cleaned reader preview.
 3. Toggle content blocks on or off in the left panel, or click blocks in the preview.
 4. Choose the output directory and PDF filename.
@@ -30,6 +30,7 @@ The default output directory is `pdf/`.
 
 - JavaScript, forms, iframes, active embeds, navigation-like regions, ads, cookie prompts, and social/share widgets are removed before preview.
 - Images are included when they are part of selected content and can be removed by deselecting their block.
+- Links in selected content are preserved as clickable PDF links when they are safe external links.
 - Uploading a single HTML file works, but browser-saved asset folders are only preserved when the app is given the original file path on disk.
 - ReportLab is the default PDF engine because it does not need extra native graphics libraries on macOS.
 
@@ -94,8 +95,8 @@ falls back to locally saved assets. Local assets are served through
 
 ReportLab is the default PDF engine. It maps the selected reader blocks to
 ReportLab flowables: headings, paragraphs, lists, tables, preformatted blocks,
-and images. This keeps output stable and reader-like instead of trying to
-reproduce arbitrary website CSS.
+images, and safe links. This keeps output stable and reader-like instead of
+trying to reproduce arbitrary website CSS.
 
 WeasyPrint support is still present behind `HTML2PDF_USE_WEASYPRINT=1`, but it
 requires native libraries on macOS. When enabled and importable, `/api/generate`

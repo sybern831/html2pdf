@@ -97,7 +97,6 @@ input {
   background: #ffffff;
 }
 
-.load-form button,
 #generate {
   color: #ffffff;
   border-color: var(--accent);
@@ -105,7 +104,6 @@ input {
   font-weight: 700;
 }
 
-.load-form button:hover,
 #generate:not(:disabled):hover {
   border-color: var(--accent-strong);
   background: var(--accent-strong);

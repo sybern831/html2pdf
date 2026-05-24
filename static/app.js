@@ -16,6 +16,8 @@ const outputDir = document.querySelector("#output-dir");
 const filename = document.querySelector("#filename");
 const result = document.querySelector("#result");
 const statusLine = document.querySelector("#status");
+let pathLoadTimer = null;
+let loadRequestId = 0;
 
 async function refreshStatus() {
   const response = await fetch("/api/status");
@@ -103,23 +105,50 @@ function escapeHtml(text) {
   }[char]));
 }
 
-loadForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
+function resetLoadedDocument() {
+  currentSession = null;
+  blocks = [];
+  selected.clear();
+  blockList.className = "block-list empty";
+  blockList.textContent = "Load an HTML file to begin.";
+  readerPreview.innerHTML = "";
+  originalPreview.removeAttribute("src");
+  generateButton.disabled = true;
+  selectAllButton.disabled = true;
+  selectNoneButton.disabled = true;
+}
+
+function looksLikeHtmlPath(path) {
+  return /\.(html?|HTML?)$/.test(path.trim());
+}
+
+async function loadDocument(source) {
+  const requestId = ++loadRequestId;
   setResult("");
   statusLine.textContent = "Loading and cleaning the page...";
   selected.clear();
+  generateButton.disabled = true;
+  selectAllButton.disabled = true;
+  selectNoneButton.disabled = true;
 
   const form = new FormData();
-  if (fileInput.files[0]) {
+  if (source === "file" && fileInput.files[0]) {
     form.append("file", fileInput.files[0]);
+  } else if (source === "path" && pathInput.value.trim()) {
+    form.append("path", pathInput.value.trim());
+  } else {
+    resetLoadedDocument();
+    statusLine.textContent = "Ready.";
+    return;
   }
-  form.append("path", pathInput.value);
 
   const response = await fetch("/api/load", { method: "POST", body: form });
   const data = await response.json();
+  if (requestId !== loadRequestId) return;
   if (!response.ok) {
     statusLine.textContent = "Ready.";
     setResult(data.error || "Could not load that HTML file.", true);
+    resetLoadedDocument();
     return;
   }
 
@@ -132,6 +161,47 @@ loadForm.addEventListener("submit", async (event) => {
   selectAllButton.disabled = false;
   selectNoneButton.disabled = false;
   statusLine.textContent = `Loaded ${blocks.length} candidate content blocks from ${data.source_path}`;
+}
+
+function schedulePathLoad() {
+  window.clearTimeout(pathLoadTimer);
+  if (!pathInput.value.trim()) {
+    ++loadRequestId;
+    resetLoadedDocument();
+    refreshStatus();
+    return;
+  }
+  if (!looksLikeHtmlPath(pathInput.value)) return;
+  pathLoadTimer = window.setTimeout(() => loadDocument("path"), 450);
+}
+
+loadForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (looksLikeHtmlPath(pathInput.value)) {
+    window.clearTimeout(pathLoadTimer);
+    loadDocument("path");
+  }
+});
+
+pathInput.addEventListener("input", () => {
+  if (fileInput.value) fileInput.value = "";
+  schedulePathLoad();
+});
+
+pathInput.addEventListener("change", () => {
+  if (fileInput.value) fileInput.value = "";
+  if (looksLikeHtmlPath(pathInput.value)) {
+    window.clearTimeout(pathLoadTimer);
+    loadDocument("path");
+  }
+});
+
+fileInput.addEventListener("change", () => {
+  window.clearTimeout(pathLoadTimer);
+  if (fileInput.files[0]) {
+    pathInput.value = "";
+    loadDocument("file");
+  }
 });
 
 generateButton.addEventListener("click", async () => {

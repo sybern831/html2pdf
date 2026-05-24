@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
@@ -73,7 +73,6 @@ DROP_TAGS = {
     "embed",
     "canvas",
     "svg",
-    "form",
     "input",
     "button",
     "select",
@@ -84,7 +83,16 @@ NOISE_RE = re.compile(
     r"(?:^|[-_\s])("
     r"ad|ads|advert|advertisement|banner|breadcrumb|cookie|consent|footer|header|"
     r"login|menu|modal|nav|newsletter|outbrain|popup|promo|recommend|related|"
-    r"share|sharing|sidebar|social|sponsor|subscribe|teaser|tracking|widget"
+    r"share|sharing|sidebar|social|sponsor|subscribe|teaser|tracking"
+    r")(?:[-_\s]|$)",
+    re.I,
+)
+
+BLOCK_NOISE_RE = re.compile(
+    r"(?:^|[-_\s])("
+    r"affiliations?|audio|comments?|footer|hide|jump|latest|newest|newsletter|"
+    r"player|related|share|sharing|sponsors?|toolbar|toolbox|"
+    r"program|meta|utility|utilities"
     r")(?:[-_\s]|$)",
     re.I,
 )
@@ -105,6 +113,18 @@ CONTENT_TAGS = {
     "figure",
 }
 
+CONTENT_DIV_CLASSES = {
+    "abstract-title",
+    "article-title-main",
+    "caption",
+    "figure-section",
+    "h6",
+    "para",
+    "title",
+}
+
+CONTENT_IDS = {"html-abstract", "html-keywords"}
+
 
 @dataclass
 class ReaderBlock:
@@ -123,6 +143,7 @@ class DocumentSession:
 
     id: str
     source_path: Path
+    source_url: Optional[str]
     title: str
     original_html: str
     blocks: List[ReaderBlock]
@@ -164,24 +185,29 @@ def read_html(path: Path) -> str:
     return data.decode("latin-1", errors="replace")
 
 
-def clean_soup(raw_html: str) -> BeautifulSoup:
+def clean_soup(raw_html: str, strip_attributes: bool = True) -> BeautifulSoup:
     """Parse and sanitize raw HTML before content extraction.
 
     This removes active content, obvious page chrome, comments, and most
     attributes. The result is still HTML, but much closer to static reader
-    content and safer to preview in the sandboxed iframe/reader view.
+    content and safer to preview in the sandboxed iframe/reader view. During
+    extraction, callers can keep attributes temporarily so class/id hints are
+    still available for block-level filtering.
     """
 
     soup = BeautifulSoup(raw_html, "lxml")
     for comment in soup.find_all(string=lambda s: isinstance(s, Comment)):
         comment.extract()
+    for form in soup.find_all("form"):
+        form.unwrap()
     for tag in soup.find_all(DROP_TAGS):
         tag.decompose()
     for tag in list(soup.find_all(True)):
         if tag.parent and is_noise(tag):
             tag.decompose()
-    for tag in soup.find_all(True):
-        clean_attributes(tag)
+    if strip_attributes:
+        for tag in soup.find_all(True):
+            clean_attributes(tag)
     return soup
 
 
@@ -190,12 +216,17 @@ def is_noise(tag: Tag) -> bool:
 
     The rule combines semantic tags such as ``nav`` and ``aside`` with class,
     id, role, and aria-label patterns commonly used for menus, ads, sharing
-    controls, cookie prompts, and related-content boxes.
+    controls, cookie prompts, and related-content boxes. Page-level containers
+    and article-like headers are protected because many news sites place real
+    headlines, lead images, and captions in elements whose classes include
+    words such as ``header``.
     """
 
+    if tag.name in {"html", "body", "main", "article"}:
+        return False
     if not getattr(tag, "attrs", None):
         return False
-    if tag.name in {"nav", "header", "footer", "aside"}:
+    if tag.name in {"nav", "footer", "aside"}:
         return True
     blob = " ".join(
         filter(
@@ -208,7 +239,11 @@ def is_noise(tag: Tag) -> bool:
             ],
         )
     )
-    return bool(blob and NOISE_RE.search(blob))
+    if not blob or not NOISE_RE.search(blob):
+        return False
+    if tag.name == "header" and tag.find(["h1", "h2", "p", "figure", "img"]):
+        return False
+    return True
 
 
 def clean_attributes(tag: Tag) -> None:
@@ -225,6 +260,7 @@ def clean_attributes(tag: Tag) -> None:
         "srcset",
         "data-src",
         "data-srcset",
+        "data-original",
         "alt",
         "title",
         "colspan",
@@ -290,9 +326,120 @@ def text_score(tag: Tag) -> int:
 
 
 def choose_root(soup: BeautifulSoup) -> Tag:
-    """Select the highest-scoring content root for block extraction."""
+    """Select the highest-scoring content root for block extraction.
 
-    return max(candidate_roots(soup), key=text_score)
+    Page-level roots often win by a tiny margin because they include comments,
+    footers, or recommendation blocks. When a non-page container has a similar
+    score, prefer it as the more likely article boundary.
+    """
+
+    candidates = list(candidate_roots(soup))
+    best_score = max(text_score(candidate) for candidate in candidates)
+    close_candidates = [candidate for candidate in candidates if text_score(candidate) >= best_score * 0.8]
+    return max(close_candidates, key=lambda candidate: (root_priority(candidate), text_score(candidate)))
+
+
+def root_priority(tag: Tag) -> int:
+    """Rank likely article roots ahead of generic page wrappers."""
+
+    labels = ancestry_blob(tag).lower()
+    title_bonus = 5 if tag.find(["h1", "h2"], recursive=True) or tag.find(class_="article-title-main") else 0
+    if tag.name in {"article", "main"}:
+        return 5 + title_bonus
+    if any(marker in labels for marker in ("article-container", "content-column", "l-story__main")):
+        return 4 + title_bonus
+    if any(marker in labels for marker in ("journalfulltext", "widget-articlefulltext", "contenttab")):
+        return 3 + title_bonus
+    if tag.name in {"body", "html", "[document]"}:
+        return title_bonus
+    return 1 + title_bonus
+
+
+def is_content_block_tag(tag: Tag) -> bool:
+    """Return whether a tag should become a selectable reader block."""
+
+    if tag.name in CONTENT_TAGS:
+        return True
+    if tag.get("id") in CONTENT_IDS:
+        return True
+    if tag.name == "div" and CONTENT_DIV_CLASSES.intersection(tag.get("class", [])):
+        return True
+    if tag.name == "section" and CONTENT_DIV_CLASSES.intersection(tag.get("class", [])):
+        return True
+    return False
+
+
+def is_heading_like_block(tag: Tag) -> bool:
+    """Return whether a short block should be kept as a heading."""
+
+    if tag.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+        return True
+    return tag.name == "div" and {"abstract-title", "h6", "article-title-main"}.intersection(tag.get("class", []))
+
+
+def ancestry_blob(tag: Tag) -> str:
+    """Collect class/id/role labels from a tag and its ancestors."""
+
+    parts = []
+    for current in [tag, *list(tag.parents)]:
+        if not isinstance(current, Tag):
+            continue
+        if current.name in {"html", "body"}:
+            continue
+        parts.extend(
+            filter(
+                None,
+                [
+                    current.get("id"),
+                    " ".join(current.get("class", [])),
+                    current.get("role"),
+                    current.get("aria-label"),
+                ],
+            )
+        )
+    return " ".join(parts)
+
+
+def is_block_noise(tag: Tag) -> bool:
+    """Skip selectable blocks that live inside post-article UI regions."""
+
+    blob = ancestry_blob(tag)
+    lowered_blob = blob.lower()
+    noisy_substrings = (
+        "articlejump",
+        "figuresandtables",
+        "figuretab",
+        "field-terms",
+        "tabletab",
+        "rendered-terms",
+        "story__tags",
+        "supplementtab",
+        "tag-list",
+    )
+    if any(marker in lowered_blob for marker in noisy_substrings):
+        return True
+    if not blob or not BLOCK_NOISE_RE.search(blob):
+        return False
+    if (
+        tag.name == "figure"
+        and tag.find(["img", "figcaption", "p"])
+        and "l-story__full" in blob
+        and not re.search(r"(?:latest|newest|secondary|sponsor)", blob, re.I)
+    ):
+        return False
+    return True
+
+
+def page_source_url(soup: BeautifulSoup) -> Optional[str]:
+    """Find the original page URL from common saved-page metadata."""
+
+    canonical = soup.find("link", rel=lambda value: value and "canonical" in value)
+    if canonical and canonical.get("href"):
+        return canonical["href"]
+    og_url = soup.find("meta", attrs={"property": "og:url"})
+    if og_url and og_url.get("content"):
+        return og_url["content"]
+    return None
 
 
 def srcset_candidates(value: str) -> List[tuple[int, str]]:
@@ -330,7 +477,7 @@ def image_candidates(img: Tag) -> List[str]:
 
     scored: List[tuple[int, int, str]] = []
     order = 0
-    for attr in ("src", "data-src"):
+    for attr in ("src", "data-src", "data-original"):
         value = (img.get(attr) or "").strip()
         if value:
             scored.append((0, order, value))
@@ -436,14 +583,14 @@ def simplify_block(
         src = choose_image_src(source_path, img, session_id, image_cache)
         if src:
             img["src"] = src
-        for attr in ("srcset", "data-src", "data-srcset"):
+        for attr in ("srcset", "data-src", "data-srcset", "data-original"):
             if attr in img.attrs:
                 del img.attrs[attr]
         if not img.get("alt"):
             img["alt"] = ""
     text = tag.get_text(" ", strip=True)
     has_image = bool(tag.find("img"))
-    if len(text) < 25 and not has_image and tag.name not in {"h1", "h2", "h3"}:
+    if len(text) < 25 and not has_image and not is_heading_like_block(tag):
         return None
     label = text[:120] if text else "Image"
     block_id = f"b-{uuid.uuid4().hex[:10]}"
@@ -459,28 +606,35 @@ def extract_blocks(source_path: Path) -> DocumentSession:
     """
 
     raw_html = read_html(source_path)
-    soup = clean_soup(raw_html)
+    source_url = page_source_url(BeautifulSoup(raw_html, "lxml"))
+    soup = clean_soup(raw_html, strip_attributes=False)
     title = (soup.title.get_text(" ", strip=True) if soup.title else source_path.stem) or source_path.stem
     blocks: List[ReaderBlock] = []
     session_id = uuid.uuid4().hex
     image_cache: Dict[str, Path] = {}
     root = choose_root(soup)
 
-    for tag in root.find_all(list(CONTENT_TAGS), recursive=True):
-        if tag.find_parent(list(CONTENT_TAGS)):
+    for tag in root.find_all(is_content_block_tag, recursive=True):
+        if tag.find_parent(is_content_block_tag):
+            continue
+        if is_block_noise(tag):
             continue
         block = simplify_block(tag, source_path, session_id, image_cache)
         if block:
             blocks.append(block)
 
     if not blocks:
-        for paragraph in root.find_all(["p", "img"]):
+        for paragraph in root.find_all(lambda tag: tag.name in {"p", "img"} or is_content_block_tag(tag)):
+            if is_block_noise(paragraph):
+                continue
             block = simplify_block(paragraph, source_path, session_id, image_cache)
             if block:
                 blocks.append(block)
 
+    for tag in soup.find_all(True):
+        clean_attributes(tag)
     rewrite_preview_assets(soup, source_path, session_id)
-    session = DocumentSession(session_id, source_path, title, str(soup), blocks, image_cache)
+    session = DocumentSession(session_id, source_path, source_url, title, str(soup), blocks, image_cache)
     SESSIONS[session_id] = session
     return session
 
@@ -616,24 +770,45 @@ def resolve_ui_asset(session: DocumentSession, src: str) -> Optional[Path]:
     return resolve_asset(session.source_path, src)
 
 
-def safe_paragraph_html(tag: Tag) -> str:
+def normalize_href(session: DocumentSession, href: str) -> Optional[str]:
+    """Return a PDF-safe link target or ``None`` when the link is unusable."""
+
+    href = (href or "").strip()
+    if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+        return None
+    parsed = urlparse(href)
+    if parsed.scheme in {"http", "https", "mailto", "tel"}:
+        return href
+    if parsed.scheme:
+        return None
+    base = session.source_url or session.source_path.as_uri()
+    return urljoin(base, href)
+
+
+def safe_paragraph_html(tag: Tag, session: DocumentSession) -> str:
     """Reduce a tag to ReportLab-friendly inline markup.
 
     ReportLab supports only a small HTML subset inside ``Paragraph`` objects,
-    so this strips links and unwraps unsupported elements while preserving
-    simple emphasis and line-break markup.
+    so this unwraps unsupported elements while preserving simple emphasis,
+    line-breaks, and safe ``<a href=...>`` links.
     """
 
-    allowed = {"b", "strong", "i", "em", "u", "br", "sup", "sub"}
+    allowed = {"a", "b", "strong", "i", "em", "u", "br", "sup", "sub"}
     soup = BeautifulSoup(str(tag), "lxml")
     root = soup.find(tag.name)
     if not root:
         return ""
     for child in root.find_all(True):
         if child.name == "a":
-            child.unwrap()
+            href = normalize_href(session, child.get("href", ""))
+            if href:
+                child.attrs = {"href": href, "color": "#1a5fb4"}
+            else:
+                child.unwrap()
         elif child.name not in allowed:
             child.unwrap()
+        else:
+            child.attrs = {}
     return root.decode_contents().strip() or root.get_text(" ", strip=True)
 
 
@@ -691,12 +866,12 @@ def generate_reportlab_pdf(session: DocumentSession, selected_ids: set[str], out
         if not root:
             continue
         if root.name in {"h1", "h2"}:
-            story.append(Paragraph(root.get_text(" ", strip=True), styles["Heading2"]))
+            story.append(Paragraph(safe_paragraph_html(root, session), styles["Heading2"]))
         elif root.name in {"h3", "h4", "h5", "h6"}:
-            story.append(Paragraph(root.get_text(" ", strip=True), styles["Heading3"]))
+            story.append(Paragraph(safe_paragraph_html(root, session), styles["Heading3"]))
         elif root.name in {"ul", "ol"}:
             items = [
-                ListItem(Paragraph(safe_paragraph_html(li), styles["Normal"]))
+                ListItem(Paragraph(safe_paragraph_html(li, session), styles["Normal"]))
                 for li in root.find_all("li", recursive=False)
                 if li.get_text(" ", strip=True)
             ]
@@ -707,7 +882,10 @@ def generate_reportlab_pdf(session: DocumentSession, selected_ids: set[str], out
         elif root.name == "table":
             rows = []
             for tr in root.find_all("tr"):
-                row = [cell.get_text(" ", strip=True) for cell in tr.find_all(["th", "td"])]
+                row = [
+                    Paragraph(safe_paragraph_html(cell, session), styles["Normal"])
+                    for cell in tr.find_all(["th", "td"])
+                ]
                 if row:
                     rows.append(row)
             if rows:
@@ -728,7 +906,7 @@ def generate_reportlab_pdf(session: DocumentSession, selected_ids: set[str], out
                 add_image(story, session, img, max_width)
             text = root.get_text(" ", strip=True)
             if text:
-                story.append(Paragraph(safe_paragraph_html(root), styles["Normal"]))
+                story.append(Paragraph(safe_paragraph_html(root, session), styles["Normal"]))
         story.append(Spacer(1, 7))
     doc.build(story)
 
